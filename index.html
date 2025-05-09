@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<title>Dual-Path Visual-Inertial Tracking (mit Drift-Korrektur)</title>
+<style>
+  body { font-family: sans-serif; margin: 20px }
+  video, canvas { display: block; margin-bottom: 10px; border: 1px solid #444 }
+  #pos, #imu, #dir { font-family: monospace; margin: 5px 0 }
+  #startBtn, #cameraSelect { padding: 8px; margin-bottom: 10px }
+</style>
+</head>
+<body>
+
+<h2>📷 3D-Pfad-Tracking<br><small>🔴 mit &nbsp;|&nbsp; 🔵 ohne&nbsp; Motion-Prediction</small></h2>
+
+<button id="startBtn">Tracking starten</button><br>
+<label for="cameraSelect">Kamera auswählen:</label>
+<select id="cameraSelect"></select>
+
+<video id="video" width="160" height="120" autoplay playsinline muted></video>
+<canvas id="output" width="160" height="120"></canvas>
+<canvas id="pathCanvas" width="300" height="300"></canvas>
+
+<div id="pos">x = 0.00, y = 0.00</div>
+<div id="imu">yaw = 0°, pitch = 0°, z = 0.00</div>
+<div id="dir">Richtung: –</div>
+
+<script>
+// ===== Konstanten ============================================================
+const W = 160, H = 120;
+const MAX_PTS = 20, MIN_DIST = 5;
+const ZUPT = 0.2;
+const PATH_MAX = 1200, pathScaleDefault = 10;
+const DRIFT_THRESH = 0.3;                // px mittlere Bewegung → sonst Stop
+
+// ===== DOM-Elemente ==========================================================
+const v = document.getElementById('video');
+const out = document.getElementById('output'),  octx = out.getContext('2d');
+const pcan = document.getElementById('pathCanvas'), pctx = pcan.getContext('2d');
+const tmp = document.createElement('canvas'); tmp.width = W; tmp.height = H;
+const tctx = tmp.getContext('2d');
+
+// ===== State-Variablen =======================================================
+let stream = null, devId = null;
+let prevGray = null;
+let prevPtsKalman = [], prevPtsRaw = [];
+
+let posKalman = {x: 0, y: 0};
+let posRaw    = {x: 0, y: 0};
+let yaw = 0, pitch = 0;
+
+let zEst = 0, zVel = 0, zOpt = 0, lastAccZ = 0, lastT = Date.now();
+
+let pathKalman = [], pathRaw = [];
+
+let frameSkip = 0;                       // zählt Frames für Skip-Logik
+
+// ===== Kamera ================================================================
+async function listCams() {
+  const dev = await navigator.mediaDevices.enumerateDevices();
+  const sel = document.getElementById('cameraSelect');
+  const cams = dev.filter(d => d.kind === 'videoinput');
+  sel.innerHTML = '';
+  cams.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId; o.text = d.label || `Cam ${i+1}`;
+    sel.appendChild(o);
+  });
+  if (!devId && cams.length) { devId = cams[0].deviceId; sel.value = devId; }
+}
+async function startCam(id) {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: W, height: H, deviceId: id ? {exact:id} : undefined },
+    audio: false
+  });
+  v.srcObject = stream;
+  requestAnimationFrame(loop);
+}
+document.getElementById('startBtn').addEventListener('click', async () => {
+  document.getElementById('startBtn').style.display = 'none';
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ video: true });
+    s.getTracks().forEach(t => t.stop());
+  } catch (e) { alert('Bitte Kamera erlauben'); return; }
+  await listCams(); startCam(devId);
+});
+document.getElementById('cameraSelect').addEventListener('change', e => {
+  devId = e.target.value; startCam(devId);
+});
+
+// ===== IMU-Integration =======================================================
+window.addEventListener('deviceorientation', e => {
+  yaw = e.alpha || 0; pitch = e.beta || 0;
+});
+window.addEventListener('devicemotion', e => {
+  const now = Date.now(), dt = (now - lastT) / 1000; lastT = now;
+  lastAccZ = e.accelerationIncludingGravity?.z || 0;
+  if (Math.abs(lastAccZ) < ZUPT) { zVel = 0; return; }
+  const corr = lastAccZ * (1 + zOpt * 0.05);
+  zVel += corr * dt; zEst += zVel * dt;
+});
+
+// ===== Bild-Hilfsfunktionen ==================================================
+function toGray(img) {
+  const g = new Uint8ClampedArray(W*H);
+  for (let i=0;i<g.length;i++) {
+    const r=img.data[i*4], g1=img.data[i*4+1], b=img.data[i*4+2];
+    g[i] = 0.299*r + 0.587*g1 + 0.114*b;
+  }
+  return g;
+}
+
+function shiTomasiScore(gray) {
+  const score = new Float32Array(W*H);
+  for (let y=1;y<H-1;y++) for (let x=1;x<W-1;x++) {
+    let sIx2=0,sIy2=0,sIxIy=0;
+    for (let j=-1;j<=1;j++) for (let i=-1;i<=1;i++) {
+      const idx=(y+j)*W+(x+i);
+      const Ix = gray[idx+1] - gray[idx-1];
+      const Iy = gray[idx+W] - gray[idx-W];
+      sIx2 += Ix*Ix; sIy2 += Iy*Iy; sIxIy += Ix*Iy;
+    }
+    const tr = sIx2 + sIy2;
+    const det = sIx2*sIy2 - sIxIy*sIxIy;
+    score[y*W+x] = 0.5*(tr - Math.sqrt(Math.max(tr*tr - 4*det,0)));
+  }
+  return score;
+}
+function addShiTomasiPoints(gray, pts) {
+  if (pts.length >= MAX_PTS) return pts;
+  const sc = shiTomasiScore(gray), cand=[];
+  for (let y=1;y<H-1;y++) for (let x=1;x<W-1;x++) {
+    const idx=y*W+x; if (sc[idx] > 100)
+      cand.push({x,y,score:sc[idx],oldX:x,oldY:y});
+  }
+  cand.sort((a,b)=>b.score-a.score);
+  for (const p of cand) {
+    if (pts.length >= MAX_PTS) break;
+    if (pts.every(q=>Math.hypot(p.x-q.x,p.y-q.y) > MIN_DIST)) pts.push(p);
+  }
+  return pts;
+}
+
+// ===== Motion-Prediction =====================================================
+function predictMotion(prevPts) {
+  if (!prevPts || prevPts.length < 2) return prevPts;
+  let dx=0, dy=0, n=0;
+  for (const p of prevPts) {
+    if ('x' in p && 'oldX' in p) { dx += p.x-p.oldX; dy += p.y-p.oldY; n++; }
+  }
+  if (!n) return prevPts;
+  dx/=n; dy/=n;
+  return prevPts.map(p=>({x:p.x+dx,y:p.y+dy,oldX:p.x,oldY:p.y,score:p.score||0}));
+}
+
+// ===== Lucas-Kanade ==========================================================
+function lk(curr, prev, pts) {
+  const res=[], hw=1, MAX_MOVE=5;
+  for (const pt of pts) {
+    const {x,y}=pt;
+    if (x<hw||x>=W-hw||y<hw||y>=H-hw) continue;
+    let A00=0,A01=0,A11=0,b0=0,b1=0;
+    for (let j=-hw;j<=hw;j++) for (let i=-hw;i<=hw;i++) {
+      const idx=(y+j)*W+(x+i);
+      const Ix=(prev[idx+1]-prev[idx-1])/2;
+      const Iy=(prev[(y+j+1)*W+x+i]-prev[(y+j-1)*W+x+i])/2;
+      const It=curr[idx]-prev[idx];
+      A00+=Ix*Ix; A01+=Ix*Iy; A11+=Iy*Iy;
+      b0-=Ix*It;  b1-=Iy*It;
+    }
+    const det=A00*A11-A01*A01;
+    if (Math.abs(det)<1) continue;
+    const dx=(b0*A11-b1*A01)/det;
+    const dy=(A00*b1-A01*b0)/det;
+    if (Math.hypot(dx,dy) < MAX_MOVE)
+      res.push({x:x+dx,y:y+dy,oldX:x,oldY:y});
+  }
+  return res;
+}
+
+// ===== Zeichnen ==============================================================
+function drawFeatures(img, pts) {
+  octx.putImageData(img,0,0);
+  octx.fillStyle='yellow';
+  for (const p of pts) octx.fillRect(p.x-1,p.y-1,3,3);
+}
+function drawPath() {
+  if (!pathKalman.length && !pathRaw.length) return;
+  const all=pathKalman.concat(pathRaw);
+  let minX=all[0].x,maxX=all[0].x,minY=all[0].y,maxY=all[0].y;
+  for (const p of all){
+    minX=Math.min(minX,p.x);maxX=Math.max(maxX,p.x);
+    minY=Math.min(minY,p.y);maxY=Math.max(maxY,p.y);
+  }
+  const scale=Math.min((pcan.width-20)/(maxX-minX||1),
+                       (pcan.height-20)/(maxY-minY||1),
+                       pathScaleDefault);
+  pctx.clearRect(0,0,pcan.width,pcan.height);
+
+  pctx.lineWidth=2;
+  // 🔴 Kalman
+  pctx.strokeStyle='red';
+  for (let i=1;i<pathKalman.length;i++){
+    const a=pathKalman[i-1], b=pathKalman[i];
+    const ax=10+(a.x-minX)*scale, ay=10+(a.y-minY)*scale;
+    const bx=10+(b.x-minX)*scale, by=10+(b.y-minY)*scale;
+    pctx.beginPath();pctx.moveTo(ax,ay);pctx.lineTo(bx,by);pctx.stroke();
+  }
+  // 🔵 Raw
+  pctx.strokeStyle='blue';
+  for (let i=1;i<pathRaw.length;i++){
+    const a=pathRaw[i-1], b=pathRaw[i];
+    const ax=10+(a.x-minX)*scale, ay=10+(a.y-minY)*scale;
+    const bx=10+(b.x-minX)*scale, by=10+(b.y-minY)*scale;
+    pctx.beginPath();pctx.moveTo(ax,ay);pctx.lineTo(bx,by);pctx.stroke();
+  }
+}
+
+// ===== Haupt-Loop ============================================================
+function loop(){
+  // --- Frame-Skip: nur jeden 2. Frame verarbeiten ---------------------------
+  if (++frameSkip & 1) { requestAnimationFrame(loop); return; } // ungerade Frames überspringen
+
+  tctx.drawImage(v,0,0,W,H);
+  const img = tctx.getImageData(0,0,W,H);
+  const gray= toGray(img);
+
+  // --- Kalman-Pfad -----------------------------------------------------------
+  const predPts   = predictMotion(prevPtsKalman);
+  let ptsKalman   = prevGray && predPts.length ? lk(gray, prevGray, predPts) : [];
+  if (ptsKalman.length<5) ptsKalman = addShiTomasiPoints(gray, ptsKalman);
+  else if (ptsKalman.length<MAX_PTS) addShiTomasiPoints(gray, ptsKalman);
+
+  // --- Raw-Pfad --------------------------------------------------------------
+  let ptsRaw = prevGray && prevPtsRaw.length ? lk(gray, prevGray, prevPtsRaw) : [];
+  if (ptsRaw.length<5) ptsRaw = addShiTomasiPoints(gray, ptsRaw);
+  else if (ptsRaw.length<MAX_PTS) addShiTomasiPoints(gray, ptsRaw);
+
+  // --- Drift-Korrektur & Positions-Update (Kalman) ---------------------------
+  let sdxK=0,sdyK=0;
+  for (const p of ptsKalman) if ('oldX'in p){sdxK+=p.x-p.oldX;sdyK+=p.y-p.oldY;}
+  let meanMoveK = Math.hypot(sdxK, sdyK) / (ptsKalman.length || 1);
+  if (meanMoveK < DRIFT_THRESH) { sdxK = 0; sdyK = 0; } // einfrieren
+  if (ptsKalman.length){
+    posKalman.x -= sdxK/ptsKalman.length;
+    posKalman.y -= sdyK/ptsKalman.length;
+  }
+
+  // --- Drift-Korrektur & Positions-Update (Raw) ------------------------------
+  let sdxR=0,sdyR=0;
+  for (const p of ptsRaw) if ('oldX'in p){sdxR+=p.x-p.oldX;sdyR+=p.y-p.oldY;}
+  let meanMoveR = Math.hypot(sdxR, sdyR) / (ptsRaw.length || 1);
+  if (meanMoveR < DRIFT_THRESH) { sdxR = 0; sdyR = 0; }
+  if (ptsRaw.length){
+    posRaw.x -= sdxR/ptsRaw.length;
+    posRaw.y -= sdyR/ptsRaw.length;
+  }
+
+  // --- Pfade aktualisieren ---------------------------------------------------
+  pathKalman.push({x:posKalman.x,y:posKalman.y});
+  pathRaw.push({x:posRaw.x,y:posRaw.y});
+  if (pathKalman.length>PATH_MAX) pathKalman.shift();
+  if (pathRaw.length>PATH_MAX)    pathRaw.shift();
+
+  // --- Anzeige ---------------------------------------------------------------
+  drawFeatures(img, ptsKalman);
+  drawPath();
+
+  document.getElementById('pos').textContent =
+        `x = ${posKalman.x.toFixed(2)}, y = ${posKalman.y.toFixed(2)}`;
+  document.getElementById('imu').textContent =
+        `yaw = ${yaw.toFixed(1)}°, pitch = ${pitch.toFixed(1)}°, z = ${zEst.toFixed(2)}`;
+
+  prevGray = gray;
+  prevPtsKalman = ptsKalman.map(p=>({...p}));
+  prevPtsRaw    = ptsRaw.map(p=>({...p}));
+
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
